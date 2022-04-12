@@ -1,0 +1,13 @@
+dask
+dask-image
+dask-jobqueue
+distributed
+libtiff
+numpy
+pandas
+PyOpenGL
+PyOpenGL_accelerate
+rasterio
+scikit-image
+scipy
+tifffile

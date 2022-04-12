@@ -34,6 +34,7 @@ import skimage
 from skimage import util
 from skimage.transform import resize, downscale_local_mean
 from dask_jobqueue import LSFCluster
+from dask_jobqueue import SLURMCluster
 from distributed import LocalCluster
 from tifffile import TiffFile
 from multiprocessing.pool import ThreadPool
@@ -130,6 +131,67 @@ def get_LSFCLuster(
     return cluster
 
 
+def get_SLURMCluster(
+    threads_per_worker: int = 1,
+    walltime: str = "1:00",
+    death_timeout: str = "1000s",
+    **kwargs
+) -> SLURMCluster:
+    """Create a dask_jobqueue.SLURMCluster.
+    This function wraps the class dask_jobqueue.SLURMCLuster and instantiates this class with some sensible defaults,
+    given how the Allen Institute and BIL clusters are configured.
+    This function will add environment variables that prevent libraries (OPENMP, MKL, BLAS) from running multithreaded routines with parallelism
+    that exceeds the number of requested cores.
+    Additional keyword arguments added to this function will be passed to the dask_jobqueue.SLURMCluster constructor.
+    Parameters
+    ----------
+    threads_per_worker: int
+        Number of cores to request from LSF. Directly translated to the `cores` kwarg to SLURMCluster.
+    walltime: str
+        The expected lifetime of a worker. Defaults to one hour, i.e. "1:00"
+    cores: int
+        The number of cores to request per worker. Defaults to 1.
+    death_timeout: str
+        The duration for the scheduler to wait for workers before flagging them as dead, e.g. "600s". For jobs with a large number of workers,
+        LSF may take a long time (minutes) to request workers. This timeout value must exceed that duration, otherwise the scheduler will
+        flag these slow-to-arrive workers as unresponsive and kill them.
+    **kwargs:
+        Additional keyword arguments passed to the SLURMCluster constructor
+    Examples
+    --------
+    >>> cluster = get_SLURMCLuster(cores=2, project="scicompsoft", queue="normal")
+    """
+    if "env_extra" not in kwargs:
+        kwargs["env_extra"] = []
+
+    kwargs["env_extra"].extend(make_single_threaded_env_vars(threads_per_worker))
+
+    USER = os.environ["USER"]
+    HOME = os.environ["HOME"]
+
+    print(kwargs)
+
+    if "local_directory" not in kwargs:
+        # The default local scratch directory on the Janelia Cluster
+        kwargs["local_directory"] = f"/scratch/{USER}/"
+
+    if "log_directory" not in kwargs:
+        log_dir = f"{HOME}/.dask_distributed/"
+        print(log_dir)
+        Path(log_dir).mkdir(parents=False, exist_ok=True)
+        kwargs["log_directory"] = log_dir
+
+    print(kwargs)
+
+    cluster = SLURMCluster(
+        cores=threads_per_worker,
+        walltime=walltime,
+        death_timeout=death_timeout,
+        **kwargs,
+    )
+    return cluster
+
+
 def get_LocalCluster(threads_per_worker: int = 1, n_workers: int = 0, memory_limit: str = '16GB', **kwargs):
     """
     Creata a distributed.LocalCluster with defaults that make it more similar to a deployment on the Janelia Compute cluster.
@@ -158,6 +220,7 @@ def get_cluster(
     deployment: Optional[str] = None,
     local_kwargs: Dict[str, Any] = {},
     lsf_kwargs: Dict[str, Any] = {"memory": "16GB"},
+    slurm_kwargs: Dict[str, Any] = {"memory": "16GB"}
 ) -> Union[LSFCluster, LocalCluster]:
 
     """Convenience function to generate a dask cluster on either a local machine or the compute cluster.
@@ -200,6 +263,8 @@ def get_cluster(
             raise EnvironmentError(
                 "You requested an LSFCluster but the command `bsub` is not available."
             )
+    elif deployment == "slurm":
+        cluster = get_SLURMCluster(threads_per_worker, walltime, **slurm_kwargs)
     elif deployment == "local":
         cluster = get_LocalCluster(threads_per_worker, 0, local_memory_limit, **local_kwargs)
     else:
@@ -316,6 +381,7 @@ def save_block(chunk, target_path, nlevels, dim_leaf, ch, block_id=None):
     full_path = os.path.join(dir_path, "default.{0}.tif".format(ch))
 
     print(full_path)
+    sys.stdout.flush()
 
     skimage.io.imsave(full_path, chunk, compress=6)
 
@@ -349,6 +415,7 @@ def downsample_and_save_block(chunk_coord, target_path, level, dim_leaf, ch, typ
     full_path = os.path.join(dir_path, img_name)
 
     print(full_path)
+    sys.stdout.flush()
 
     if level > 1:
         skimage.io.imsave(full_path, img_down, compress=6)
@@ -413,7 +480,11 @@ def convert_block_ktx(chunk_coord, source_path, target_path, level, downsample_i
         except BaseException as err:
             print(err)
 
+    sys.stdout.flush()
+
 def conv_tiled_tiff(input, output, tilesize):
+    print(f"converting tiff {input}")
+    sys.stdout.flush()
     if not os.path.exists(input):
         return input
 
@@ -465,6 +536,7 @@ def build_octree_from_tiff_slices():
 
     usage_text = ("Usage:" + "  slice2octree.py" + " [options]")
     parser = argparse.ArgumentParser(description=usage_text)
+    parser.add_argument("--tempdir", type=str, default=None, help="local directory for worker file spilling")
     parser.add_argument("-t", "--thread", dest="number", type=int, default=16, help="number of threads")
     parser.add_argument("-i", "--inputdir", dest="input", type=str, default="", help="input directories")
     parser.add_argument("-f", "--inputfile", dest="file", type=str, default="", help="input image stacks")
@@ -477,10 +549,12 @@ def build_octree_from_tiff_slices():
     parser.add_argument("--voxsize", dest="voxsize", type=str, default="1.0,1.0,1.0", help="voxel size of the top-level image")
     parser.add_argument("--memory", dest="memory", type=str, default="16GB", help="memory amount per thread (for LSF cluster)")
     parser.add_argument("--project", dest="project", type=str, default=None, help="project name (for LSF cluster)")
+    parser.add_argument("--queue", type=str, default=None, help="partition name (option -p for SLURM cluster)")
     parser.add_argument("--maxjobs", dest="maxjobs", type=int, default=16, help="maximum jobs (for LSF cluster)")
     parser.add_argument("--walltime", dest="walltime", type=str, default="1:00", help="expected lifetime of a worker. Defaults to one hour, i.e. 1:00 (for LSF cluster)")
     parser.add_argument("--maxbatch", dest="maxbatch", type=int, default=0, help="number of blocks per job")
     parser.add_argument("--lsf", dest="lsf", default=False, action="store_true", help="use LSF cluster")
+    parser.add_argument("--slurm", default=False, action="store_true", help="use SLURM cluster")
     parser.add_argument("--ktx", dest="ktx", default=False, action="store_true", help="generate ktx files")
     parser.add_argument("--ktxonly", dest="ktxonly", default=False, action="store_true", help="output only a ktx octree")
     parser.add_argument("--ktxout", dest="ktxout", type=str, default=None, help="output directory for a ktx octree")
@@ -492,6 +566,9 @@ def build_octree_from_tiff_slices():
         exit()
 
     args = parser.parse_args(argv)
+
+    print(args)
+    sys.stdout.flush()
 
     tnum = args.number
     indirs = args.input.split(",")
@@ -538,12 +615,31 @@ def build_octree_from_tiff_slices():
     maxbatch = args.maxbatch
 
     my_lsf_kwargs={}
+    my_slurm_kwargs = {}
 
     my_lsf_kwargs['memory'] = args.memory
+    my_slurm_kwargs['memory'] = args.memory
     local_memory_limit = args.memory
+
+    if args.tempdir:
+        my_lsf_kwargs['local_directory'] = args.tempdir
+        my_slurm_kwargs['local_directory'] = args.tempdir
     
     if args.project:
        my_lsf_kwargs['project'] = args.project
+       my_slurm_kwargs['project'] = args.project
+
+    if args.queue:
+        my_lsf_kwargs['queue'] = args.queue
+        my_slurm_kwargs['queue'] = args.queue
+
+    dashboard_address = None
+    if monitoring:
+        dashboard_address = ":8787"
+        my_lsf_kwargs['scheduler_options'] = {"dashboard_address": dashboard_address}
+        my_slurm_kwargs['scheduler_options'] = {"dashboard_address": dashboard_address}
+
+    #my_slurm_kwargs['env_extra'] = ["source /bil/users/arshadic/.bashrc", "conda activate octree2"]
     
     cluster = None
     if args.cluster:
@@ -552,17 +648,19 @@ def build_octree_from_tiff_slices():
         cluster = get_cluster(deployment="lsf", walltime=args.walltime, lsf_kwargs = my_lsf_kwargs)
         cluster.adapt(minimum_jobs=1, maximum_jobs = args.maxjobs)
         cluster.scale(tnum)
+    elif args.slurm:
+        cluster = get_cluster(deployment="slurm", walltime=args.walltime, slurm_kwargs=my_slurm_kwargs)
+        #cluster.adapt(minimum_jobs=1, maximum_jobs=args.maxjobs)
+        cluster.scale(tnum)
     else:
         cluster = get_cluster(deployment="local", local_memory_limit = local_memory_limit)
         cluster.scale(tnum)
 
-    dashboard_address = None
-    if monitoring: 
-        dashboard_address = ":8787"
-        print(f"Starting dashboard on {dashboard_address}")
-        client = Client(address=cluster, processes=True, dashboard_address=dashboard_address)
-    else:
-        client = Client(address=cluster)
+    print(cluster)
+    print(cluster.dashboard_link)
+
+    client = Client(address=cluster)
+    print(client)
 
     task_num = tnum * 2
     if not args.lsf:
@@ -574,6 +672,7 @@ def build_octree_from_tiff_slices():
             task_num = tmp_batch_num * 2
 
     print("batch_num: " + str(task_num))
+    sys.stdout.flush()
 
     images = None
     dim = None
@@ -686,6 +785,8 @@ def build_octree_from_tiff_slices():
     else:
         ch_ids = [ch+i for i in range(0, len(indirs))]
 
+    sys.stdout.flush()
+
     #initial
     if len(indirs) > 0:
         for i in range(0, len(indirs)):
@@ -705,6 +806,9 @@ def build_octree_from_tiff_slices():
                 for tlist in chunked_tif_list:
                     future = dask.delayed(conv_tiled_tiffs)(tlist, tmpdir, (256, 256))
                     futures.append(future)
+                    #print("adding future")
+                #print(cluster.job_script())
+                #sys.stdout.flush()
                 with ProgressBar():
                     results = dask.compute(futures)
                     img_files = [item for sublist in results[0] for item in sublist]
