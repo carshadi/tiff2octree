@@ -1,4 +1,5 @@
 
+
 import argparse
 import fnmatch
 import glob
@@ -10,6 +11,7 @@ import os
 import random
 import sys
 import time
+import socket
 import uuid
 import warnings
 from pathlib import Path
@@ -36,6 +38,7 @@ from skimage.transform import resize, downscale_local_mean
 from dask_jobqueue import LSFCluster
 from dask_jobqueue import SLURMCluster
 from distributed import LocalCluster
+from distributed import performance_report
 from tifffile import TiffFile
 from multiprocessing.pool import ThreadPool
 
@@ -365,8 +368,9 @@ def save_block_from_slices(chunk_coord, file_paths, target_path, nlevels, dim_le
         img_data = get_cropped_image_rasterio(file_paths, dim_leaf[0]*(chunk_coord[0]-1), dim_leaf[1]*(chunk_coord[1]-1), dim_leaf[2]*(chunk_coord[2]-1), dim_leaf[0], dim_leaf[1], dim_leaf[2], type, ch)
     
         print(full_path)
+
         Path(dir_path).mkdir(parents=True, exist_ok=True)
-        skimage.io.imsave(full_path, img_data, compress=6)
+        skimage.io.imsave(full_path, img_data, compress=6, check_contrast=False)
 
 
 def save_block(chunk, target_path, nlevels, dim_leaf, ch, block_id=None):
@@ -381,9 +385,8 @@ def save_block(chunk, target_path, nlevels, dim_leaf, ch, block_id=None):
     full_path = os.path.join(dir_path, "default.{0}.tif".format(ch))
 
     print(full_path)
-    sys.stdout.flush()
 
-    skimage.io.imsave(full_path, chunk, compress=6)
+    skimage.io.imsave(full_path, chunk, compress=6, check_contrast=False)
 
     return np.array(block_id[0])[None, None, None] if block_id != None else np.array(0)[None, None, None]
 
@@ -418,9 +421,9 @@ def downsample_and_save_block(chunk_coord, target_path, level, dim_leaf, ch, typ
     sys.stdout.flush()
 
     if level > 1:
-        skimage.io.imsave(full_path, img_down, compress=6)
+        skimage.io.imsave(full_path, img_down, compress=6, check_contrast=False)
     else:
-        skimage.io.imsave(full_path, img_down)
+        skimage.io.imsave(full_path, img_down, check_contrast=False)
 
 def convert_block_ktx_batch(chunk_coords, source_path, target_path, level, downsample_intensity, downsample_xy, make_dir, delete_source):
     for pos in chunk_coords:
@@ -483,8 +486,6 @@ def convert_block_ktx(chunk_coord, source_path, target_path, level, downsample_i
     sys.stdout.flush()
 
 def conv_tiled_tiff(input, output, tilesize):
-    print(f"converting tiff {input}")
-    sys.stdout.flush()
     if not os.path.exists(input):
         return input
 
@@ -500,12 +501,12 @@ def conv_tiled_tiff(input, output, tilesize):
     if not is_tiled:
         try:
             img = skimage.io.imread(input)
-            skimage.io.imsave(output, img, compress=6, tile=tilesize)
+            skimage.io.imsave(output, img, compress=6, tile=tilesize, check_contrast=False)
             print("saved tiled-tiff: " + output)
         except BaseException as err:
             print(err)
             return input
-    
+
     return output
 
 def conv_tiled_tiffs(input_list, outdir, tilesize):
@@ -536,7 +537,7 @@ def build_octree_from_tiff_slices():
 
     usage_text = ("Usage:" + "  slice2octree.py" + " [options]")
     parser = argparse.ArgumentParser(description=usage_text)
-    parser.add_argument("--tempdir", type=str, default=None, help="local directory for worker file spilling")
+    parser.add_argument("--local-dir", type=str, default=None, help="local directory for dask worker file spilling")
     parser.add_argument("-t", "--thread", dest="number", type=int, default=16, help="number of threads")
     parser.add_argument("-i", "--inputdir", dest="input", type=str, default="", help="input directories")
     parser.add_argument("-f", "--inputfile", dest="file", type=str, default="", help="input image stacks")
@@ -559,6 +560,7 @@ def build_octree_from_tiff_slices():
     parser.add_argument("--ktxonly", dest="ktxonly", default=False, action="store_true", help="output only a ktx octree")
     parser.add_argument("--ktxout", dest="ktxout", type=str, default=None, help="output directory for a ktx octree")
     parser.add_argument("--cluster", dest="cluster", type=str, default=None, help="address of a dask scheduler server")
+    parser.add_argument("--scheduler-file", type=str, default=None, help="path to a scheduler json file")
     parser.add_argument("--dry", dest="dry", default=False, action="store_true", help="dry run")
 
     if not argv:
@@ -621,9 +623,9 @@ def build_octree_from_tiff_slices():
     my_slurm_kwargs['memory'] = args.memory
     local_memory_limit = args.memory
 
-    if args.tempdir:
-        my_lsf_kwargs['local_directory'] = args.tempdir
-        my_slurm_kwargs['local_directory'] = args.tempdir
+    if args.local_dir:
+        my_lsf_kwargs['local_directory'] = args.local_dir
+        my_slurm_kwargs['local_directory'] = args.local_dir
     
     if args.project:
        my_lsf_kwargs['project'] = args.project
@@ -639,28 +641,30 @@ def build_octree_from_tiff_slices():
         my_lsf_kwargs['scheduler_options'] = {"dashboard_address": dashboard_address}
         my_slurm_kwargs['scheduler_options'] = {"dashboard_address": dashboard_address}
 
-    #my_slurm_kwargs['env_extra'] = ["source /bil/users/arshadic/.bashrc", "conda activate octree2"]
-    
-    cluster = None
-    if args.cluster:
-        cluster = args.cluster
-    elif args.lsf:
-        cluster = get_cluster(deployment="lsf", walltime=args.walltime, lsf_kwargs = my_lsf_kwargs)
-        cluster.adapt(minimum_jobs=1, maximum_jobs = args.maxjobs)
-        cluster.scale(tnum)
-    elif args.slurm:
-        cluster = get_cluster(deployment="slurm", walltime=args.walltime, slurm_kwargs=my_slurm_kwargs)
-        #cluster.adapt(minimum_jobs=1, maximum_jobs=args.maxjobs)
-        cluster.scale(tnum)
+    if args.scheduler_file:
+        print("using scheduler file")
+        client = Client(scheduler_file=args.scheduler_file)
     else:
-        cluster = get_cluster(deployment="local", local_memory_limit = local_memory_limit)
-        cluster.scale(tnum)
+        cluster = None
+        if args.cluster:
+            cluster = args.cluster
+        elif args.lsf:
+            cluster = get_cluster(deployment="lsf", walltime=args.walltime, lsf_kwargs = my_lsf_kwargs)
+            cluster.adapt(minimum_jobs=1, maximum_jobs = args.maxjobs)
+            cluster.scale(tnum)
+        elif args.slurm:
+            cluster = get_cluster(deployment="slurm", walltime=args.walltime, slurm_kwargs=my_slurm_kwargs)
+            cluster.adapt(minimum_jobs=1, maximum_jobs=args.maxjobs)
+            cluster.scale(tnum)
+        else:
+            cluster = get_cluster(deployment="local", local_memory_limit = local_memory_limit)
+            cluster.scale(tnum)
+        print(cluster)
+        print(cluster.job_script())
+        client = Client(address=cluster)
 
-    print(cluster)
-    print(cluster.dashboard_link)
-
-    client = Client(address=cluster)
     print(client)
+    print(client.dashboard_link)
 
     task_num = tnum * 2
     if not args.lsf:
@@ -806,9 +810,6 @@ def build_octree_from_tiff_slices():
                 for tlist in chunked_tif_list:
                     future = dask.delayed(conv_tiled_tiffs)(tlist, tmpdir, (256, 256))
                     futures.append(future)
-                    #print("adding future")
-                #print(cluster.job_script())
-                #sys.stdout.flush()
                 with ProgressBar():
                     results = dask.compute(futures)
                     img_files = [item for sublist in results[0] for item in sublist]
