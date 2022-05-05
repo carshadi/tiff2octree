@@ -1,5 +1,6 @@
 
 
+import traceback
 import argparse
 import fnmatch
 import glob
@@ -472,6 +473,8 @@ def convert_block_ktx(chunk_coord, source_path, target_path, level, downsample_i
     except BaseException as err:
         print(err)
         print("Error writing file %s" % full_file)
+        print(repr(err))
+        traceback.print_exc()
         f.flush()
         f.close()
         os.unlink(f.name)
@@ -546,6 +549,7 @@ def build_octree_from_tiff_slices():
     parser.add_argument("-c", "--channel", dest="channel", type=int, default=0, help="channel id")
     parser.add_argument("-d", "--downsample", dest="downsample", type=str, default='area', help="downsample method: 2ndmax, area, aa(anti-aliasing), spline")
     parser.add_argument("-m", "--monitor", dest="monitor", default=False, action="store_true", help="activate monitoring")
+    parser.add_argument("--dtype", type=str, default=None, help="data type of the output image. Any numpy type string is acceptable.")
     parser.add_argument("--origin", dest="origin", type=str, default="0,0,0", help="position of the corner of the top-level image in nanometers")
     parser.add_argument("--voxsize", dest="voxsize", type=str, default="1.0,1.0,1.0", help="voxel size of the top-level image")
     parser.add_argument("--memory", dest="memory", type=str, default="16GB", help="memory amount per thread (for LSF cluster)")
@@ -652,15 +656,16 @@ def build_octree_from_tiff_slices():
             cluster = get_cluster(deployment="lsf", walltime=args.walltime, lsf_kwargs = my_lsf_kwargs)
             cluster.adapt(minimum_jobs=1, maximum_jobs = args.maxjobs)
             cluster.scale(tnum)
+            print(cluster.job_script())
         elif args.slurm:
             cluster = get_cluster(deployment="slurm", walltime=args.walltime, slurm_kwargs=my_slurm_kwargs)
             cluster.adapt(minimum_jobs=1, maximum_jobs=args.maxjobs)
             cluster.scale(tnum)
+            print(cluster.job_script())
         else:
             cluster = get_cluster(deployment="local", local_memory_limit = local_memory_limit)
             cluster.scale(tnum)
         print(cluster)
-        print(cluster.job_script())
         client = Client(address=cluster)
 
     print(client)
@@ -718,6 +723,10 @@ def build_octree_from_tiff_slices():
     print("Image dimensions: " + str(dim))
     print("Image type: " + str(volume_dtype))
     print("samples per pixel: " + str(im_chnum))
+
+    if args.dtype is not None:
+        print(f"Will use type {args.dtype} for output")
+        volume_dtype = args.dtype
     
     while(dim[0] % pow(2, nlevels) > 0):
         dim[0] -= 1
